@@ -1,0 +1,26 @@
+version: 2
+
+sources:
+  - name: raw
+    database: "{{ env_var('SNOWFLAKE_RAW_DATABASE', 'STREAMING_DB') }}"
+    schema: "{{ env_var('SNOWFLAKE_RAW_SCHEMA', 'RAW_SCHEMA') }}"
+    tables:
+      - name: raw_ecommerce_events
+        description: >
+          Raw VARIANT landing table populated continuously by
+          ingestion/consumer_snowflake.py from the ecommerce_events_raw
+          Kafka topic. One row per Kafka message.
+        loaded_at_field: ingested_at
+        config:
+          freshness:
+            warn_after: {count: "{{ var('source_freshness_warn_minutes') }}", period: minute}
+            error_after: {count: "{{ var('source_freshness_error_minutes') }}", period: minute}
+        columns:
+          - name: raw_event
+            description: Full JSON payload of the clickstream/transaction event (VARIANT).
+          - name: kafka_partition
+            description: Kafka partition the message was read from.
+          - name: kafka_offset
+            description: Kafka offset of the message within its partition.
+          - name: ingested_at
+            description: Timestamp the row was written into Snowflake by the consumer.

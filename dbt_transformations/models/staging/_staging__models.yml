@@ -1,0 +1,53 @@
+version: 2
+
+models:
+
+  - name: stg_clickstream
+    description: One row per de-duplicated clickstream/transaction event, typed from raw VARIANT.
+    columns:
+      - name: event_id
+        description: Unique identifier for the event (UUID).
+        tests:
+          - unique
+          - not_null
+      - name: event_timestamp
+        tests:
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+      - name: session_id
+        tests:
+          - not_null
+      - name: event_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['page_view', 'add_to_cart', 'remove_from_cart', 'checkout_start', 'purchase']
+      - name: device_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['mobile', 'desktop', 'tablet']
+      - name: price
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: stg_transactions
+    description: Purchase-only subset of stg_clickstream, representing completed transactions.
+    columns:
+      - name: transaction_id
+        tests:
+          - unique
+          - not_null
+      - name: transaction_amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true

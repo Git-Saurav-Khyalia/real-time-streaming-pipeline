@@ -1,0 +1,38 @@
+version: 2
+
+models:
+
+  - name: fct_realtime_revenue
+    description: >
+      Minute-grain revenue fact table with a trailing rolling-window GMV,
+      order count, average order value, and cart-abandonment rate. Intended
+      for DirectQuery consumption in Power BI's live GMV counter tile.
+    columns:
+      - name: minute_bucket
+        tests:
+          - unique
+          - not_null
+      - name: rolling_gmv
+        tests:
+          - not_null
+
+  - name: dim_user_sessions
+    description: >
+      One row per user session with funnel stage, device, and revenue
+      attribution. Powers the conversion funnel, top-categories, and
+      device-mix dashboard tiles.
+    columns:
+      - name: session_id
+        tests:
+          - unique
+          - not_null
+      - name: funnel_stage
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['browsed_only', 'added_to_cart', 'checkout_started', 'purchased', 'unknown']
+      - name: device_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['mobile', 'desktop', 'tablet']

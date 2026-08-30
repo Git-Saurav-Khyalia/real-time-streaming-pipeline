@@ -1,0 +1,35 @@
+name: 'ecommerce_streaming_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'ecommerce_streaming_pipeline'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Rolling-window size (minutes) used by fct_realtime_revenue for the
+  # moving-average GMV calculation. Override at runtime with --vars.
+  rolling_window_minutes: 5
+  # How stale RAW_ECOMMERCE_EVENTS is allowed to be before source freshness fails.
+  source_freshness_warn_minutes: 10
+  source_freshness_error_minutes: 30
+
+models:
+  ecommerce_streaming_pipeline:
+    +materialized: view
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: marts
+      +tags: ["marts"]

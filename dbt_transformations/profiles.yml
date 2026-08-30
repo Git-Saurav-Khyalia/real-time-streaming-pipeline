@@ -1,0 +1,35 @@
+# dbt connection profile for Snowflake.
+# All secrets are pulled from environment variables — never hardcode
+# credentials here. Place this file at ~/.dbt/profiles.yml locally, or point
+# DBT_PROFILES_DIR at this directory:
+#   export DBT_PROFILES_DIR=$(pwd)/dbt_transformations
+
+ecommerce_streaming_pipeline:
+  target: dev
+  outputs:
+
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'STREAMING_DB') }}"
+      schema: "{{ env_var('SNOWFLAKE_DBT_SCHEMA', 'DBT_DEV') }}"
+      threads: 4
+      client_session_keep_alive: false
+      query_tag: dbt_ecommerce_streaming
+
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'SYSADMIN') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'STREAMING_DB') }}"
+      schema: "PROD"
+      threads: 8
+      client_session_keep_alive: false
+      query_tag: dbt_ecommerce_streaming_prod
