@@ -36,3 +36,58 @@ models:
           - accepted_values:
               arguments:
                 values: ['mobile', 'desktop', 'tablet']
+
+  - name: dim_users
+    description: One row per user with activity span, session/order counts and lifetime value.
+    columns:
+      - name: user_id
+        tests:
+          - unique
+          - not_null
+      - name: lifetime_value
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: dim_products
+    description: One row per product with dominant category, price range and engagement counts.
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+
+  - name: fct_orders
+    description: Order-grain fact table (one row per purchase) keyed to dim_users, dim_products and dim_user_sessions.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: order_amount
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: user_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_users')
+                field: user_id
+      - name: product_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_products')
+                field: product_id
+      - name: session_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_user_sessions')
+                field: session_id

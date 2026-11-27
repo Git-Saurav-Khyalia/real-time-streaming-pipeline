@@ -1,336 +1,129 @@
-# Real-Time E-Commerce Streaming Pipeline
+# Real-Time E-Commerce Data Engineering Platform
 
-An end-to-end streaming analytics platform: a synthetic clickstream generator
-publishes live events to **Kafka**, a Python consumer loads them into
-**Snowflake**, and **dbt** transforms the raw JSON into analytics-ready
-staging and mart tables.
+![CI](https://github.com/YOUR_GITHUB_USERNAME/real-time-streaming-pipeline/actions/workflows/ci.yml/badge.svg)
 
-**IMPLEMENTED** (built, run, and tested end-to-end):
-```
-Python producer → Kafka → Snowflake RAW → dbt staging → dbt marts
-```
+**Python · Apache Kafka · PySpark Structured Streaming · AWS S3 (MinIO locally) · Delta Lake · Snowflake · dbt · Airflow · Great Expectations · Docker**
 
-**OPTIONAL** (not included in this repo — a suggested next step only):
-```
-Power BI visualization on top of the dbt marts
-```
-No `.pbix` file, Power BI workspace, or dashboard is included in this
-project. Section 3 below is a configuration *guide* for anyone who wants to
-build their own Power BI report against the marts — it does not describe
-anything shipped here.
+An end-to-end streaming data platform for e-commerce clickstream, order and
+transaction events. Events flow through a Bronze → Silver → Gold medallion
+lakehouse on Delta Lake, are validated by Great Expectations, orchestrated by
+Airflow, and modelled into dimensional tables and marts in Snowflake with dbt.
 
-```
-Faker/Python  ─▶  Kafka (Zookeeper + Schema Registry)  ─▶  Python Consumer
-producer.py        ecommerce_events_raw topic              consumer_snowflake.py
-                                                                    │
-                                                                    ▼
-                                              Snowflake STREAMING_DB.RAW_SCHEMA
-                                              .RAW_ECOMMERCE_EVENTS (VARIANT)
-                                                                    │
-                                                                    ▼
-                                        dbt: staging (stg_clickstream,
-                                        stg_transactions) ─▶ marts
-                                        (fct_realtime_revenue,
-                                        dim_user_sessions)
-                                                                    │
-                                                                    ▼
-                                        STREAMING_DB.DBT_DEV_STAGING /
-                                        STREAMING_DB.DBT_DEV_MARTS
-                                        (queryable by any BI tool)
+```mermaid
+flowchart LR
+    P[Python producer<br/>duplicates · late · invalid events] --> K[(Apache Kafka)]
+    K --> B
+
+    subgraph Lake[Delta Lake on S3 / MinIO — PySpark Structured Streaming]
+        B[Bronze<br/>raw payload + Kafka lineage] --> S[Silver<br/>parsed · validated · de-duplicated]
+        S --> G[Gold<br/>event-time windows + watermark]
+        S -.invalid.-> Q[(Quarantine / dead letter)]
+    end
+
+    subgraph Airflow[Airflow DAG every 15 min]
+        V1[Great Expectations<br/>Silver] --> R[Gold reconciliation<br/>late data] --> V2[Great Expectations<br/>Gold]
+        V1 --> L[Load Silver → Snowflake RAW] --> D[dbt run + test]
+    end
+
+    S --> V1
+    L --> SF[(Snowflake)]
+    D --> SF
 ```
 
----
+## Quick start (one command, nothing to simulate)
 
-## 1. Prerequisites
-
-- Docker & Docker Compose
-- Python 3.10+
-- A Snowflake account (trial account works fine) with a warehouse you can use
-- dbt-snowflake (`pip install dbt-snowflake`)
-- *(Optional, only if you want a dashboard)* Power BI Desktop or Power BI
-  Service, with the Snowflake connector — see Section 3
-
----
-
-## 2. Local Setup (under 5 minutes)
-
-### Step 1 — Start the Kafka stack
+Requires Docker Desktop (≈6 GB RAM free). **No cloud account is needed** for the lakehouse half.
 
 ```bash
-docker compose up -d
-docker compose ps          # confirm zookeeper, kafka, schema-registry, kafka-ui are healthy
+docker compose up -d --build          # Kafka, MinIO (S3), producer, Spark streaming job
+make report                            # waits until Bronze/Silver/Gold have data; fails if Silver has duplicates
 ```
 
-Kafka UI is available at http://localhost:8080 to visually confirm topics and
-messages once the producer is running.
+The producer starts automatically and keeps emitting ~10 events/s, deliberately
+including **3 % duplicates, 5 % late events and 1 % invalid records**, so
+de-duplication, watermarking and quarantine are exercised continuously.
 
-### Step 2 — Set up Snowflake objects
+| Service | URL |
+|---|---|
+| Kafka UI | http://localhost:8080 |
+| MinIO console (the "S3" bucket `ecommerce-lakehouse`) | http://localhost:9001 (`minioadmin` / `minioadmin`) |
+| Airflow (optional profile) | http://localhost:8088 (`admin` / `admin`) |
 
-Run once in a Snowflake worksheet (adjust names/warehouse size as needed):
-
-```sql
-CREATE WAREHOUSE IF NOT EXISTS COMPUTE_WH
-    WAREHOUSE_SIZE = 'XSMALL'
-    AUTO_SUSPEND = 60
-    AUTO_RESUME = TRUE;
-
-CREATE DATABASE IF NOT EXISTS STREAMING_DB;
-CREATE SCHEMA IF NOT EXISTS STREAMING_DB.RAW_SCHEMA;
-
-CREATE TABLE IF NOT EXISTS STREAMING_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS (
-    raw_event         VARIANT,
-    kafka_partition    NUMBER,
-    kafka_offset       NUMBER,
-    ingested_at        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
-```
-
-dbt targets this same `STREAMING_DB` database and will auto-create its own
-`DBT_DEV_STAGING` and `DBT_DEV_MARTS` schemas on first `dbt run` (no need to
-create those schemas by hand). `consumer_snowflake.py` will also auto-create
-the raw table above if it doesn't exist, but creating the warehouse/database
-up front avoids a first-run race.
-
-### Step 3 — Start the event producer
+Add orchestration (Airflow + Great Expectations + Snowflake/dbt branch):
 
 ```bash
-cd data_generator
-python -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-python producer.py --rate 5 --topic ecommerce_events_raw --bootstrap-servers localhost:9092
+docker compose --profile orchestration up -d --build     # or: make up-all
 ```
 
-You should see periodic `Sent N events (X.X events/sec avg)` log lines.
+Without Snowflake credentials the DAG validates Silver, reconciles and
+validates Gold, and **skips** the Snowflake/dbt branch (a `ShortCircuit` task, not a failure).
+To enable it, copy `.env.example` to `.env`, fill in the `SNOWFLAKE_*` values and re-run the
+command above; the DAG then loads Silver into Snowflake and runs `dbt run` + `dbt test`.
+Reset everything with `make down`.
 
-### Step 4 — Start the Snowflake consumer
+## How each capability is implemented
 
-In a second terminal:
+| Capability | Where |
+|---|---|
+| Kafka ingestion of clickstream, order and transaction events | [`data_generator/producer.py`](data_generator/producer.py) (idempotent producer, 3 partitions keyed by `user_id`) |
+| PySpark Structured Streaming | [`lakehouse/streams.py`](lakehouse/streams.py), entry point [`lakehouse/run_streaming.py`](lakehouse/run_streaming.py) |
+| **Event-time windows** | 1-minute tumbling windows per category, [`aggregate_revenue`](lakehouse/transformations.py), with a 10-minute watermark bounding state |
+| **Deduplication** | In-batch `row_number()` on `event_id` + idempotent insert-only Delta `MERGE` into Silver ([`delta_io.insert_only_merge`](lakehouse/delta_io.py)), so replays and Kafka redeliveries never create duplicates |
+| **Late-arriving records** | Kept in Silver and flagged `is_late`; the streaming Gold query honours the watermark, and [`rebuild_gold`](lakehouse/jobs/rebuild_gold.py) (run by Airflow) folds records that missed the watermark back into Gold |
+| Invalid records | Routed to a Delta quarantine table with the rejection reason (`malformed_json`, `invalid_price`, …) |
+| **Medallion architecture on S3 + Delta Lake** | `bronze/`, `silver/`, `gold/` Delta tables under `s3a://ecommerce-lakehouse` ([`lakehouse/config.py`](lakehouse/config.py)); MinIO locally, real S3 by configuration |
+| Incremental transformations | Each layer is its own streaming query with its own checkpoint; Silver/Gold read the upstream Delta table as a stream |
+| **Airflow orchestration** | [`dags/ecommerce_lakehouse_dag.py`](dags/ecommerce_lakehouse_dag.py) (+ nightly `OPTIMIZE`/`VACUUM` DAG) |
+| **dbt + dimensional models + marts in Snowflake** | [`dbt_transformations/`](dbt_transformations): staging → `dim_users`, `dim_products`, `dim_user_sessions`, `fct_orders`, `fct_realtime_revenue`, with relationship/uniqueness/range tests |
+| **Great Expectations** | Schema, null, uniqueness, set-membership and range checks on Silver and Gold ([`quality/expectations.py`](quality/expectations.py)); every run is appended to the Delta table `quality/validation_results`; failures fail the DAG before Snowflake is touched |
+| **Docker** | Compose stack with Kafka, MinIO, producer, Spark, Airflow; images in [`docker/`](docker) |
+
+### Design decisions worth knowing
+
+* **Why `MERGE` for Silver de-duplication instead of `dropDuplicates` with a watermark?**
+  Stateful streaming de-duplication *drops* records older than the watermark, which would silently lose late data.
+  Insert-only `MERGE` keeps every valid event, is idempotent across restarts, and needs no unbounded state.
+* **Why a separate Gold reconciliation job?** Streaming aggregates can't change a window after the watermark passes.
+  Silver is the source of truth; the batch job makes Gold eventually exact, and also builds the hourly conversion funnel (needs distinct counts, which streaming doesn't support).
+* **Snowflake RAW keeps the original JSON contract** (`raw_event` VARIANT), so dbt works the same whether RAW is fed from Silver ([`warehouse/load_silver_to_snowflake.py`](warehouse/load_silver_to_snowflake.py)) or directly from Kafka ([`ingestion/consumer_snowflake.py`](ingestion/consumer_snowflake.py), the original low-latency path, still included).
+* **Delta writers**: one Spark application writes each table, so Delta's default S3 single-driver log store is safe. Multi-cluster writers would need DynamoDB-backed log store configuration.
+* **Delivery semantics**: Kafka → Bronze is at-least-once; end-to-end results are effectively-once because Silver and Gold writes are idempotent.
+
+## Running against real AWS S3 / Snowflake
+
+* **S3**: unset `S3_ENDPOINT`, set `LAKEHOUSE_BASE_PATH=s3a://<your-bucket>` and provide credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or an IAM role). Create the bucket first; the job only verifies it.
+* **Snowflake**: fill `SNOWFLAKE_*` in `.env`. `warehouse/snowflake_setup.sql` documents the objects (the loader creates them if the role allows).
+
+## Screenshots
+
+| Kafka UI | Snowflake RAW | dbt lineage |
+|---|---|---|
+| ![Kafka UI](screenshots/kafka-ui-topics.png) | ![Snowflake](screenshots/snowflake-raw-events.png) | ![dbt](screenshots/dbt-lineage-graph.png) |
+
+These were captured from the original Kafka → Snowflake → dbt path.
+
+## Tests and CI
 
 ```bash
-cd ingestion
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env        # fill in your Snowflake credentials
-python consumer_snowflake.py --topic ecommerce_events_raw --batch-size 100 --flush-interval 5
+pip install -r requirements-dev.txt      # Python 3.11/3.12 and Java 17 required for Spark
+python -m pytest -q
 ```
 
-Confirm rows are landing:
+* Unit tests cover the producer, validation rules, dedup, lateness flag, window aggregation (batch **and** streaming with a watermark), table bootstrap schemas, Great Expectations suites, the Snowflake loader SQL and the Airflow DAG graph.
+* `tests/test_delta_pipeline.py` exercises Delta `MERGE` idempotency, micro-batch replay and late-data reconciliation. It downloads the Delta jars from Maven, so it is skipped offline and runs in CI.
+* GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)): tests, DAG import check, `dbt parse`, `docker compose config`. A manual workflow ([`e2e.yml`](.github/workflows/e2e.yml)) boots the full stack and asserts every layer fills with duplicate-free Silver data.
 
-```sql
-SELECT COUNT(*) FROM STREAMING_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS;
-```
-
-### Step 5 — Run dbt
-
-```bash
-cd dbt_transformations
-pip install dbt-snowflake
-export DBT_PROFILES_DIR=$(pwd)
-
-export SNOWFLAKE_ACCOUNT=your_account_identifier
-export SNOWFLAKE_USER=your_username
-export SNOWFLAKE_PASSWORD=your_password
-export SNOWFLAKE_ROLE=SYSADMIN
-export SNOWFLAKE_WAREHOUSE=COMPUTE_WH
-export SNOWFLAKE_DATABASE=STREAMING_DB
-export SNOWFLAKE_DBT_SCHEMA=DBT_DEV
-export SNOWFLAKE_RAW_DATABASE=STREAMING_DB
-export SNOWFLAKE_RAW_SCHEMA=RAW_SCHEMA
-
-dbt deps                 # installs dbt_utils
-dbt debug                # verify the connection
-dbt source freshness     # checks RAW_ECOMMERCE_EVENTS isn't stale
-dbt run
-dbt test
-```
-
-`SNOWFLAKE_DBT_SCHEMA=DBT_DEV` combines with each model's configured custom
-schema (`staging` / `marts` in `dbt_project.yml`) to produce
-`DBT_DEV_STAGING` and `DBT_DEV_MARTS` — this is dbt's default schema-naming
-behavior, not a separate setting.
-
-For a continuously live dashboard, schedule `dbt source freshness && dbt run`
-on a short interval (e.g. every 1–2 minutes via cron, a Snowflake Task, or an
-orchestrator such as Airflow/Dagster) so the marts stay fresh against the
-streaming raw table.
-
----
-
-## 3. Power BI Configuration Guide (OPTIONAL — not included in this repo)
-
-This section is a guide for anyone who wants to build their own dashboard on
-top of the dbt marts. **No Power BI report, workspace, or `.pbix` file is
-part of this project** — nothing here has been built or tested as part of
-the pipeline.
-
-### Connecting
-
-1. Power BI Desktop → **Get Data → Snowflake**.
-2. Server: `<account>.snowflakecomputing.com`, Warehouse: `COMPUTE_WH`.
-3. Choose **DirectQuery** (not Import) so the dashboard reflects new dbt runs
-   without manual refresh — critical for a "real-time" feel.
-4. Select `STREAMING_DB.DBT_DEV_MARTS.FCT_REALTIME_REVENUE` and
-   `STREAMING_DB.DBT_DEV_MARTS.DIM_USER_SESSIONS`.
-5. Under **Data source settings**, set an **Automatic Page Refresh** interval
-   (Power BI Desktop: report-level "Page refresh" in the Format pane) of
-   10–30 seconds so DirectQuery visuals re-poll Snowflake continuously.
-6. If publishing to the Power BI Service, configure **Incremental Refresh**
-   policies on any Import-mode tables (e.g. a historical archive built on top
-   of `fct_realtime_revenue`) partitioned by `minute_bucket`, refreshing only
-   the last N days and rewriting the last few hours to catch late-arriving
-   corrections.
-
-### Core DAX Measures
-
-```DAX
-Real-Time GMV =
-CALCULATE(
-    MAX(fct_realtime_revenue[rolling_gmv]),
-    FILTER(
-        fct_realtime_revenue,
-        fct_realtime_revenue[minute_bucket] = MAX(fct_realtime_revenue[minute_bucket])
-    )
-)
-
-Rolling AOV =
-CALCULATE(
-    MAX(fct_realtime_revenue[rolling_avg_order_value]),
-    FILTER(
-        fct_realtime_revenue,
-        fct_realtime_revenue[minute_bucket] = MAX(fct_realtime_revenue[minute_bucket])
-    )
-)
-
-Cart Abandonment Rate =
-CALCULATE(
-    MAX(fct_realtime_revenue[rolling_cart_abandonment_rate]),
-    FILTER(
-        fct_realtime_revenue,
-        fct_realtime_revenue[minute_bucket] = MAX(fct_realtime_revenue[minute_bucket])
-    )
-)
-
-Active Sessions =
-CALCULATE(
-    DISTINCTCOUNT(dim_user_sessions[session_id]),
-    dim_user_sessions[is_active_session] = TRUE
-)
-
-Conversion Rate (Browsed to Purchase) =
-DIVIDE(
-    CALCULATE(DISTINCTCOUNT(dim_user_sessions[session_id]), dim_user_sessions[funnel_stage] = "purchased"),
-    DISTINCTCOUNT(dim_user_sessions[session_id])
-)
-
-Sessions by Stage =
-CALCULATE(
-    DISTINCTCOUNT(dim_user_sessions[session_id])
-)   -- used as the base measure inside a funnel visual sliced by [funnel_stage]
-```
-
----
-
-## 4. Dashboard Wireframe — 4-Tile Executive Dashboard (OPTIONAL design guide)
-
-The layout below is a suggested design for the optional Power BI dashboard
-from Section 3. It is a wireframe/spec, not a built or included dashboard.
+## Repository layout
 
 ```
-┌───────────────────────────────┬───────────────────────────────┐
-│ TILE 1: Real-Time GMV Counter  │ TILE 2: Live Conversion Funnel │
-│ Card/KPI visual                │ Funnel visual                  │
-│  • Measure: [Real-Time GMV]    │  • Axis: dim_user_sessions     │
-│  • Trend sparkline beneath,    │    [funnel_stage] ordered      │
-│    built on rolling_gmv by     │    (browsed_only → added_to_   │
-│    minute_bucket (last 60 min) │    cart → checkout_started →   │
-│  • Secondary KPI: [Rolling AOV]│    purchased)                  │
-│  • Page refresh: 15s           │  • Values: [Sessions by Stage] │
-│                                 │  • Tooltip: drop-off % vs prior│
-│                                 │    stage                       │
-├───────────────────────────────┼───────────────────────────────┤
-│ TILE 3: Top Categories by      │ TILE 4: Traffic by Device      │
-│ Active Stream                  │ Donut / 100% stacked bar        │
-│ Horizontal bar chart           │  • Legend: device_type          │
-│  • Axis: dim_user_sessions     │    (mobile / desktop / tablet)  │
-│    [top_category]              │  • Values: DISTINCTCOUNT        │
-│  • Values: DISTINCTCOUNT        │    (session_id), filtered to   │
-│    (session_id) where           │    is_active_session = TRUE     │
-│    is_active_session = TRUE     │  • Drill-through to session    │
-│  • Sort descending, top 10      │    list table                   │
-└───────────────────────────────┴───────────────────────────────┘
-```
-
-**Layout notes**
-
-- Top row = money/funnel (the "so what"), bottom row = composition
-  (the "why"/"who").
-- Apply a slicer for `country` and a date/time range slicer bound to
-  `session_started_at` so the whole page can be scoped to a campaign window.
-- Use a consistent color scale: one accent color for GMV/revenue, a second
-  for funnel stages, and device-type colors held constant across tiles 2–4
-  for visual consistency.
-- Set the report-level **Page refresh** (Format pane → Page refresh → On,
-  15–30s) so all four DirectQuery visuals re-poll Snowflake automatically —
-  this is what makes the dashboard feel "live" without manual interaction.
-
----
-
-## 5. Data Quality & Freshness
-
-- `models/staging/_sources.yml` defines `freshness.warn_after` /
-  `error_after` on `RAW_ECOMMERCE_EVENTS.ingested_at` — run
-  `dbt source freshness` on a schedule to alert if the consumer stalls.
-- `unique` / `not_null` / `accepted_values` / `dbt_utils.accepted_range`
-  tests are attached to every primary key and enum-like column in
-  `models/staging/_staging__models.yml` and `models/marts/_marts__models.yml`.
-- The staging layer de-duplicates on `event_id`, absorbing Kafka's
-  at-least-once redelivery so each event is represented once in the
-  staging/marts layer. The Kafka producer itself uses idempotent delivery
-  (`enable.idempotence: True`) to avoid duplicate sends on retry — this is
-  not an end-to-end exactly-once guarantee for the whole pipeline.
-
----
-
-## 6. Repository Layout
-
-```
-real-time-streaming-pipeline/
-├── data_generator/
-│   ├── producer.py
-│   └── requirements.txt
-├── ingestion/
-│   ├── consumer_snowflake.py
-│   ├── requirements.txt
-│   └── .env.example
-├── dbt_transformations/
-│   ├── dbt_project.yml
-│   ├── profiles.yml
-│   ├── packages.yml
-│   ├── package-lock.yml
-│   └── models/
-│       ├── staging/
-│       │   ├── _sources.yml
-│       │   ├── _staging__models.yml
-│       │   ├── stg_clickstream.sql
-│       │   └── stg_transactions.sql
-│       └── marts/
-│           ├── _marts__models.yml
-│           ├── fct_realtime_revenue.sql
-│           └── dim_user_sessions.sql
-├── docker-compose.yml
-├── README.md
-└── .gitignore
-```
-
-Generated artifacts (`dbt_transformations/target/`, `dbt_transformations/dbt_packages/`,
-`dbt_transformations/logs/`, `__pycache__/`, `*.pyc`) are excluded from this
-repo via `.gitignore` and recreated automatically by `dbt deps` / `dbt run` /
-running the Python scripts.
-
-## 7. Shutting Down
-
-```bash
-# stop the Python producer/consumer with Ctrl+C (both handle SIGINT/SIGTERM
-# gracefully and flush in-flight batches before exiting)
-docker compose down -v     # stop and remove Kafka/Zookeeper/Schema Registry + volumes
+data_generator/   Kafka producer (+ duplicate/late/invalid injection)
+lakehouse/        PySpark: transformations, streaming queries, Delta I/O, batch jobs
+quality/          Great Expectations suites + runner
+warehouse/        Silver -> Snowflake loader and DDL
+dags/     Pipeline and maintenance DAGs
+dbt_transformations/  staging, dimensions, facts, marts, tests
+ingestion/        Original Kafka -> Snowflake consumer (direct path)
+docker/           Dockerfiles (Spark, producer, Airflow)
+docs/             Optional Power BI guide
+tests/            pytest suite
 ```

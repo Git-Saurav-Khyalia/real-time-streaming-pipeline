@@ -1,0 +1,24 @@
+name: End-to-end (manual)
+
+# Brings up the real stack (Kafka + MinIO + Spark streaming + producer), waits for
+# Bronze/Silver/Gold to fill, and asserts Silver contains no duplicates.
+# Run it from the Actions tab (workflow_dispatch). ~10-15 minutes.
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the pipeline
+        run: docker compose up -d --build
+      - name: Wait for data in every layer
+        run: docker compose exec -T spark-streaming python -m lakehouse.report --wait --timeout 900
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=200 spark-streaming producer kafka
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

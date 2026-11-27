@@ -1,8 +1,27 @@
+# Python
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
+
+# Secrets / local config
 .env
+
+# dbt
 dbt_transformations/target/
 dbt_transformations/dbt_packages/
 dbt_transformations/logs/
+dbt_transformations/.user.yml
+
+# Spark / Delta local artefacts
+spark-warehouse/
+metastore_db/
+derby.log
+.ivy2/
+
+# OS / IDE
 .DS_Store
+.idea/
+.vscode/

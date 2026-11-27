@@ -15,6 +15,11 @@ Design notes:
   land on the same partition (ordering guarantee per user).
 - Delivery reports and idempotent producer config used for at-least-once /
   effectively-once semantics on the Kafka side.
+- Optional "imperfect data" injection (--duplicate-rate / --late-rate /
+  --invalid-rate) deliberately re-sends events, back-dates timestamps and emits
+  malformed records, so the downstream pipeline's de-duplication, late-data
+  handling and quarantine logic are exercised continuously without any manual
+  simulation.
 
 Usage:
     python producer.py --rate 5 --topic ecommerce_events_raw \
@@ -22,6 +27,7 @@ Usage:
 """
 
 import argparse
+import collections
 import json
 import logging
 import random
@@ -30,7 +36,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from confluent_kafka import Producer
@@ -158,6 +164,70 @@ def build_event(session: SessionState) -> dict:
     return event
 
 
+@dataclass
+class ChaosConfig:
+    """Probabilities (0..1) of injecting imperfect data per generated event."""
+    duplicate_rate: float = 0.0
+    late_rate: float = 0.0
+    invalid_rate: float = 0.0
+    max_late_seconds: int = 2400  # back-date by up to 40 min (watermark is 10 min)
+
+
+class ChaosInjector:
+    """
+    Turns one clean event into the list of Kafka payloads actually sent:
+      * duplicate : re-sends a previously sent event byte-for-byte (Kafka redelivery)
+      * late      : back-dates event time, half within and half beyond the watermark
+      * invalid   : malformed JSON / negative price / unknown event_type / missing id
+    """
+
+    INVALID_KINDS = ("malformed_json", "negative_price", "bad_event_type", "missing_event_id")
+
+    def __init__(self, config: ChaosConfig, rng: Optional[random.Random] = None):
+        self.config = config
+        self.rng = rng or random.Random()
+        self._recent: collections.deque = collections.deque(maxlen=500)
+        self.counts = collections.Counter()
+
+    def mutate(self, event: dict) -> list:
+        cfg, rng = self.config, self.rng
+        payloads: list = []
+
+        if rng.random() < cfg.invalid_rate:
+            payloads.append(self._invalid_payload(event))
+            self.counts["invalid"] += 1
+        else:
+            if rng.random() < cfg.late_rate:
+                lateness = rng.choice(
+                    [rng.randint(30, 300), rng.randint(900, max(901, cfg.max_late_seconds))]
+                )
+                shifted = datetime.fromisoformat(event["timestamp"]) - timedelta(seconds=lateness)
+                event = {**event, "timestamp": shifted.isoformat()}
+                self.counts["late"] += 1
+            payload = json.dumps(event)
+            payloads.append(payload)
+            self._recent.append(payload)
+
+        if self._recent and rng.random() < cfg.duplicate_rate:
+            payloads.append(rng.choice(self._recent))
+            self.counts["duplicate"] += 1
+
+        return payloads
+
+    def _invalid_payload(self, event: dict) -> str:
+        kind = self.rng.choice(self.INVALID_KINDS)
+        if kind == "malformed_json":
+            return json.dumps(event)[: self.rng.randint(10, 60)]  # truncated JSON
+        broken = dict(event)
+        if kind == "negative_price":
+            broken["price"] = -abs(broken["price"])
+        elif kind == "bad_event_type":
+            broken["event_type"] = "teleport"
+        else:
+            broken.pop("event_id", None)
+        return json.dumps(broken)
+
+
 class GracefulKiller:
     kill_now = False
 
@@ -190,10 +260,18 @@ def build_producer(bootstrap_servers: str) -> Producer:
 def run(args: argparse.Namespace) -> None:
     producer = build_producer(args.bootstrap_servers)
     pool = SessionPool(pool_size=args.concurrent_sessions)
+    chaos = ChaosInjector(
+        ChaosConfig(
+            duplicate_rate=args.duplicate_rate,
+            late_rate=args.late_rate,
+            invalid_rate=args.invalid_rate,
+        )
+    )
     killer = GracefulKiller()
 
     interval = 1.0 / args.rate if args.rate > 0 else 0
     total_sent = 0
+    generated = 0
     start_time = time.time()
 
     logger.info(
@@ -205,28 +283,30 @@ def run(args: argparse.Namespace) -> None:
         while not killer.kill_now:
             session = pool.get_session()
             event = build_event(session)
-            payload = json.dumps(event).encode("utf-8")
+            generated += 1
 
             try:
-                producer.produce(
-                    topic=args.topic,
-                    key=event["user_id"].encode("utf-8"),
-                    value=payload,
-                    callback=delivery_report,
-                )
+                for payload in chaos.mutate(event):
+                    producer.produce(
+                        topic=args.topic,
+                        key=event["user_id"].encode("utf-8"),
+                        value=payload.encode("utf-8"),
+                        callback=delivery_report,
+                    )
+                    total_sent += 1
             except BufferError:
                 logger.warning("Local producer queue full, polling to free space")
                 producer.poll(0.5)
                 continue
 
             producer.poll(0)  # trigger delivery-report callbacks, non-blocking
-            total_sent += 1
 
-            if total_sent % 100 == 0:
+            if generated % 100 == 0:
                 elapsed = time.time() - start_time
                 logger.info(
-                    "Sent %d events (%.1f events/sec avg)",
+                    "Sent %d events (%.1f events/sec avg) injected=%s",
                     total_sent, total_sent / elapsed if elapsed > 0 else 0,
+                    dict(chaos.counts),
                 )
 
             if interval:
@@ -247,6 +327,12 @@ def parse_args() -> argparse.Namespace:
                          help="Target events per second (default: 5)")
     parser.add_argument("--concurrent-sessions", type=int, default=200,
                          help="Number of concurrent synthetic user sessions to simulate")
+    parser.add_argument("--duplicate-rate", type=float, default=0.0,
+                         help="Probability of re-sending an earlier event (default: 0)")
+    parser.add_argument("--late-rate", type=float, default=0.0,
+                         help="Probability of back-dating an event's timestamp (default: 0)")
+    parser.add_argument("--invalid-rate", type=float, default=0.0,
+                         help="Probability of emitting a malformed/invalid record (default: 0)")
     return parser.parse_args()
 
 

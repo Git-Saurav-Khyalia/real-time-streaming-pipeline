@@ -1,8 +1,60 @@
 # ---------------------------------------------------------------------------
-# Local streaming stack: Zookeeper + Kafka + Schema Registry + Kafka UI
-# Brings up everything needed to run data_generator/producer.py and
-# ingestion/consumer_snowflake.py locally.
+# Real-time e-commerce lakehouse, fully local:
+#
+#   producer -> Kafka -> Spark Structured Streaming -> Delta Lake on MinIO (S3)
+#                         bronze -> silver -> gold
+#   Airflow (profile "orchestration") -> Great Expectations -> Snowflake -> dbt
+#
+#   docker compose up -d --build                          # core pipeline
+#   docker compose --profile orchestration up -d --build  # + Airflow
 # ---------------------------------------------------------------------------
+
+x-lake-env: &lake-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  KAFKA_TOPIC: ecommerce_events_raw
+  LAKEHOUSE_BASE_PATH: s3a://ecommerce-lakehouse
+  S3_ENDPOINT: http://minio:9000
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  AWS_REGION: us-east-1
+  WATERMARK_DELAY: 10 minutes
+  GX_ANALYTICS_ENABLED: "false"
+
+x-snowflake-env: &snowflake-env
+  SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-}
+  SNOWFLAKE_USER: ${SNOWFLAKE_USER:-}
+  SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD:-}
+  SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE:-COMPUTE_WH}
+  SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE:-STREAMING_DB}
+  SNOWFLAKE_SCHEMA: ${SNOWFLAKE_SCHEMA:-RAW_SCHEMA}
+  SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE:-SYSADMIN}
+  SNOWFLAKE_RAW_DATABASE: ${SNOWFLAKE_DATABASE:-STREAMING_DB}
+  SNOWFLAKE_RAW_SCHEMA: ${SNOWFLAKE_SCHEMA:-RAW_SCHEMA}
+  SNOWFLAKE_DBT_SCHEMA: ${SNOWFLAKE_DBT_SCHEMA:-DBT_DEV}
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: ecommerce-airflow:local
+  environment: &airflow-env
+    <<: [*lake-env, *snowflake-env]
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: local-dev-secret-key-change-me
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./lakehouse:/opt/pipeline/lakehouse
+    - ./quality:/opt/pipeline/quality
+    - ./warehouse:/opt/pipeline/warehouse
+    - ./dbt_transformations:/opt/pipeline/dbt_transformations
+  networks:
+    - streaming-net
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully
 
 networks:
   streaming-net:
@@ -12,6 +64,9 @@ volumes:
   zk-data:
   zk-log:
   kafka-data:
+  minio-data:
+  ivy-cache:
+  airflow-pg-data:
 
 services:
   zookeeper:
@@ -110,12 +165,125 @@ services:
     networks:
       - streaming-net
 
+  # Creates the topic up-front so Spark never races the producer.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+        --topic ecommerce_events_raw --partitions 3 --replication-factor 1
+    networks:
+      - streaming-net
+
+  # S3-compatible object store standing in for AWS S3 (bucket is created by the Spark job).
+  minio:
+    image: pgsty/silo:RELEASE.2026-11-12T00-00-00Z
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # web console
+    volumes:
+      - minio-data:/data
+    networks:
+      - streaming-net
+
+  producer:
+    build:
+      context: .
+      dockerfile: docker/producer/Dockerfile
+    image: ecommerce-producer:local
+    container_name: producer
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    # Includes duplicates, late and invalid records so the pipeline's
+    # de-duplication, watermarking and quarantine paths run continuously.
+    command: >
+      --bootstrap-servers kafka:29092 --topic ecommerce_events_raw --rate 10
+      --duplicate-rate 0.03 --late-rate 0.05 --invalid-rate 0.01
+    networks:
+      - streaming-net
+
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: ecommerce-spark:local
+    container_name: spark-streaming
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    environment:
+      <<: *lake-env
+      SPARK_DRIVER_MEMORY: 1536m
+    networks:
+      - streaming-net
+
+  # ------------------------------ orchestration (optional profile) ---------
+  airflow-postgres:
+    image: postgres:16
+    profiles: ["orchestration"]
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    networks:
+      - streaming-net
+
+  airflow-init:
+    <<: *airflow-common
+    profiles: ["orchestration"]
+    container_name: airflow-init
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    command: >
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin
+      --lastname User --role Admin --email admin@example.com || true"
+
+  airflow-webserver:
+    <<: *airflow-common
+    profiles: ["orchestration"]
+    container_name: airflow-webserver
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8088:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    profiles: ["orchestration"]
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    command: scheduler
+
 # ---------------------------------------------------------------------------
-# Usage:
-#   docker compose up -d
-#   docker compose ps
-#   Kafka UI:        http://localhost:8080
-#   Schema Registry:  http://localhost:8081
-#   Kafka bootstrap (from host):        localhost:9092
-#   Kafka bootstrap (from containers):  kafka:29092
+# Endpoints
+#   Kafka UI        http://localhost:8080
+#   MinIO console   http://localhost:9001   (minioadmin / minioadmin)
+#   Airflow UI      http://localhost:8088   (admin / admin, profile "orchestration")
+#   Schema Registry http://localhost:8081
+#   Kafka bootstrap (host) localhost:9092   (containers) kafka:29092
 # ---------------------------------------------------------------------------

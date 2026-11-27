@@ -3,7 +3,7 @@ consumer_snowflake.py
 ----------------------
 Consumes JSON e-commerce events from Kafka (topic: ecommerce_events_raw) and
 loads them in micro-batches into a Snowflake VARIANT staging table:
-    RAW_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS
+    STREAMING_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS
 
 Design notes:
 - Manual offset commit: offsets are only committed to Kafka AFTER a batch has
@@ -21,9 +21,9 @@ Design notes:
 
 Snowflake target DDL (run once, see README.md "Snowflake Setup"):
 
-    CREATE DATABASE IF NOT EXISTS RAW_DB;
-    CREATE SCHEMA IF NOT EXISTS RAW_DB.RAW_SCHEMA;
-    CREATE TABLE IF NOT EXISTS RAW_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS (
+    CREATE DATABASE IF NOT EXISTS STREAMING_DB;
+    CREATE SCHEMA IF NOT EXISTS STREAMING_DB.RAW_SCHEMA;
+    CREATE TABLE IF NOT EXISTS STREAMING_DB.RAW_SCHEMA.RAW_ECOMMERCE_EVENTS (
         raw_event        VARIANT,
         kafka_partition   NUMBER,
         kafka_offset      NUMBER,

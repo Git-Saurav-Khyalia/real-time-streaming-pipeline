@@ -2,52 +2,84 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
-  validate:
-    name: Validate Pipeline
+  tests:
+    name: Unit + Spark/Delta tests
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            lakehouse/requirements.txt
 
-      - name: Install Python dependencies
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r ingestion/requirements.txt
+          pip install -r requirements-dev.txt
 
-      - name: Validate Python files
+      - name: Byte-compile all Python
+        run: python -m compileall -q data_generator ingestion lakehouse quality warehouse dags tests
+
+      # Includes the Delta Lake tests (MERGE idempotency, replay safety, late-data
+      # reconciliation); the Delta jars are resolved from Maven on the runner.
+      - name: Run tests
+        run: python -m pytest -q -rs
+
+  airflow-dags:
+    name: Airflow DAG integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Airflow (official constraints) + pytest
         run: |
-          python -m py_compile data_generator/*.py
-          python -m py_compile ingestion/*.py
+          pip install "apache-airflow==2.10.5" pytest==8.3.4 \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt"
+      - name: Import DAGs and check task graph
+        env:
+          AIRFLOW_HOME: /tmp/airflow
+          AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+        run: python -m pytest tests/test_airflow_dags.py -q
 
-      - name: Install dbt
-        run: |
-          pip install dbt-snowflake==1.12.3
-
-      - name: Install dbt dependencies
-        working-directory: dbt_transformations
-        run: dbt deps
-
-      - name: Validate dbt project
+  dbt:
+    name: dbt parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install dbt-snowflake==1.12.3
+      - name: dbt deps + parse (no warehouse connection needed)
         working-directory: dbt_transformations
         env:
+          DBT_PROFILES_DIR: .
           SNOWFLAKE_ACCOUNT: ci_dummy_account
           SNOWFLAKE_USER: ci_dummy_user
           SNOWFLAKE_PASSWORD: ci_dummy_password
-          SNOWFLAKE_WAREHOUSE: ci_dummy_warehouse
-          SNOWFLAKE_DATABASE: STREAMING_DB
-          SNOWFLAKE_SCHEMA: RAW_SCHEMA
-          SNOWFLAKE_ROLE: ACCOUNTADMIN
-        run: dbt parse --no-partial-parse
+        run: |
+          dbt deps
+          dbt parse --no-partial-parse
+
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile orchestration config --quiet

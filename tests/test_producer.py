@@ -120,3 +120,62 @@ def test_build_producer_uses_idempotent_configuration(monkeypatch):
     assert captured_config["enable.idempotence"] is True
     assert captured_config["acks"] == "all"
     assert captured_config["retries"] == 5
+
+# ----------------------------------------------------- imperfect-data injection
+import random
+
+
+def _event():
+    pool = producer.SessionPool(pool_size=1)
+    return producer.build_event(pool.get_session())
+
+
+def test_chaos_disabled_emits_exactly_the_clean_event():
+    injector = producer.ChaosInjector(producer.ChaosConfig(), random.Random(1))
+    event = _event()
+
+    assert injector.mutate(event) == [json.dumps(event)]
+    assert not injector.counts
+
+
+def test_chaos_duplicates_resend_an_identical_earlier_payload():
+    injector = producer.ChaosInjector(producer.ChaosConfig(duplicate_rate=1.0), random.Random(1))
+    sent = []
+    for _ in range(5):
+        payloads = injector.mutate(_event())
+        assert len(payloads) == 2  # the event plus one redelivery
+        assert payloads[1] in sent + [payloads[0]]  # byte-for-byte copy of something already sent
+        sent.append(payloads[0])
+    assert injector.counts["duplicate"] == 5
+
+
+def test_chaos_late_events_are_backdated():
+    injector = producer.ChaosInjector(producer.ChaosConfig(late_rate=1.0), random.Random(3))
+    event = _event()
+    [payload] = injector.mutate(event)
+
+    original = datetime.fromisoformat(event["timestamp"])
+    shifted = datetime.fromisoformat(json.loads(payload)["timestamp"])
+    assert (original - shifted).total_seconds() >= 30
+    assert injector.counts["late"] == 1
+
+
+def test_chaos_invalid_payloads_break_the_contract():
+    injector = producer.ChaosInjector(producer.ChaosConfig(invalid_rate=1.0), random.Random(7))
+    broken_kinds = set()
+    for _ in range(60):
+        [payload] = injector.mutate(_event())
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            broken_kinds.add("malformed_json")
+            continue
+        if "event_id" not in parsed:
+            broken_kinds.add("missing_event_id")
+        elif parsed["price"] < 0:
+            broken_kinds.add("negative_price")
+        elif parsed["event_type"] not in producer.EVENT_TYPE_WEIGHTS:
+            broken_kinds.add("bad_event_type")
+        else:
+            raise AssertionError("invalid_rate=1.0 produced a valid event")
+    assert broken_kinds == set(producer.ChaosInjector.INVALID_KINDS)
